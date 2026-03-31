@@ -1,64 +1,92 @@
 import streamlit as st
 import pandas as pd
-import math
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide")
-st.title("🏭 6-Line 智能排產模擬器")
+st.set_page_config(layout="wide", page_title="生產排程系統")
+st.title("🏭 智能排產與週報表統整 (五天工作制)")
 
-# --- 參數設定 ---
-st.sidebar.header("生產參數調整")
-uph = st.sidebar.number_input("單線 UPH", value=30)
-lines_count = st.sidebar.slider("可用產線數量", 1, 6, 6)
-shift1_hrs = 8  # 07:30 - 15:30
-shift2_hrs = 7  # 16:00 - 23:00
-daily_hrs_per_line = shift1_hrs + shift2_hrs
-total_hourly_capacity = uph * lines_count
+# --- 設定生產參數 ---
+with st.sidebar:
+    st.header("⚙️ 生產參數設定")
+    uph = st.number_input("單線 UPH", value=30)
+    lines = ["C1", "C2", "C3", "C4", "C5", "C6"]
+    daily_hrs = 15  # 早晚班 8+7 小時
+    daily_cap_per_line = uph * daily_hrs
+    st.info(f"單線日產能: {daily_cap_per_line} | 全廠日產能: {daily_cap_per_line * len(lines)}")
 
 # --- 上傳檔案 ---
-uploaded_file = st.file_uploader("請上傳工單 Excel (包含 WO, QTY, Production Line)", type=["xlsx"])
+uploaded_file = st.file_uploader("上傳原始工單 Excel", type=["xlsx"])
 
 if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    total_qty = df['QTY'].sum()
+    raw_df = pd.read_excel(uploaded_file)
+    raw_df.columns = [c.strip() for c in raw_df.columns]
     
-    st.subheader("📊 生產概況分析")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("總待產數量", f"{total_qty} units")
-    col2.metric("全廠每小時產能", f"{total_hourly_capacity} units/hr")
+    # 建立副本以免更動原始數據
+    pending_orders = raw_df.copy().to_dict('records')
     
-    # 計算理論完工天數
-    total_days = math.ceil(total_qty / (total_hourly_capacity * daily_hrs_per_line))
-    col3.metric("預計所需工期", f"{total_days} 天")
-
-    # --- 排產核心演算法 (簡化版) ---
-    start_date = datetime(2026, 3, 30)
-    current_qty = total_qty
-    schedule_data = []
+    # 排產變數
+    current_date = datetime(2026, 3, 30) # 從 3/30 週一開始
+    daily_schedules = []
     
-    temp_date = start_date
-    while current_qty > 0:
-        daily_output = min(current_qty, total_hourly_capacity * daily_hrs_per_line)
-        # 找出該日期屬於哪一週的週一
-        monday_of_week = temp_date - timedelta(days=temp_date.weekday())
+    # 核心演算：分配工單到每一天
+    while any(o['QTY'] > 0 for o in pending_orders):
+        # 💡 關鍵修正：跳過週六 (5) 與週日 (6)
+        if current_date.weekday() >= 5:
+            current_date += timedelta(days=1)
+            continue
+            
+        day_entry = {"日期": current_date.strftime("%m/%d (%a)")}
+        # 取得該週週一作為統整基準
+        monday_date = current_date - timedelta(days=current_date.weekday())
+        day_entry["週次"] = monday_date.strftime("%Y-%m-%d")
         
-        schedule_data.append({
-            "生產日期": temp_date.strftime('%Y-%m-%d'),
-            "週次起始": monday_of_week.strftime('%Y-%m-%d'),
-            "當日產出": daily_output,
-            "剩餘數量": current_qty - daily_output
-        })
-        current_qty -= daily_output
-        temp_date += timedelta(days=1)
-        if temp_date.weekday() == 6: # 假設週日不開工
-            temp_date += timedelta(days=1)
+        for line in lines:
+            line_rem_cap = daily_cap_per_line
+            line_tasks = []
+            
+            for order in pending_orders:
+                if order['QTY'] <= 0: continue
+                
+                # 產線限制檢查
+                if order['Production Line'] != 'All' and order['Production Line'] != line:
+                    continue
+                
+                take = min(line_rem_cap, order['QTY'])
+                if take > 0:
+                    line_tasks.append(f"{order['Project']} WO{order['WO']} ({int(take)})")
+                    order['QTY'] -= take
+                    line_rem_cap -= take
+                
+                if line_rem_cap <= 0: break
+            
+            day_entry[line] = " + ".join(line_tasks) if line_tasks else "-"
+        
+        daily_schedules.append(day_entry)
+        current_date += timedelta(days=1)
 
-    # --- 輸出結果 ---
-    res_df = pd.DataFrame(schedule_data)
-    st.write("### 📅 每日排程計畫預覽")
-    st.dataframe(res_df, use_container_width=True)
+    # --- 顯示結果 1：日報表 ---
+    st.subheader("📅 每日產線分配明細 (已跳過週末)")
+    display_df = pd.DataFrame(daily_schedules)
+    st.dataframe(display_df.drop(columns=["週次"]), use_container_width=True)
 
-    # 匯出您要的週報表格式
-    st.write("### 📈 每周生產統整 (Matrix View)")
-    weekly_summary = res_df.groupby("週次起始")["當日產出"].sum().reset_index()
-    st.table(weekly_summary)
+    # --- 顯示結果 2：週統整 Matrix ---
+    st.divider()
+    st.subheader("📊 每周 Project 出貨統整")
+    
+    matrix_data = []
+    for day in daily_schedules:
+        for line in lines:
+            if day[line] != "-":
+                tasks = day[line].split(" + ")
+                for t in tasks:
+                    if "(" in t:
+                        try:
+                            project = t.split(" ")[0]
+                            qty = int(t.split("(")[1].replace(")", ""))
+                            matrix_data.append({"Project": project, "週次": day["週次"], "Qty": qty})
+                        except: continue
+    
+    if matrix_data:
+        m_df = pd.DataFrame(matrix_data)
+        pivot_df = m_df.pivot_table(index="Project", columns="週次", values="Qty", aggfunc="sum").fillna(0)
+        st.table(pivot_df.astype(int))
